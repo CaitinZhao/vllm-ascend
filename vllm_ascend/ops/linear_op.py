@@ -38,8 +38,10 @@ get_row_parallel_op.
 from functools import lru_cache
 from types import SimpleNamespace
 
+import os
 import regex as re
 import torch
+import torch_npu
 import torch.distributed as dist
 from torch.nn.parameter import Parameter
 from vllm.distributed import split_tensor_along_last_dim
@@ -273,6 +275,44 @@ class OProjRowParallelOp(CustomRowParallelOp):
         self.input_size_per_partition = self.layer.input_size_per_partition
 
 
+class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
+    _HCOMM_INFO = None
+
+    def __init__(self, layer):
+        super().__init__(layer)
+        self.hcomm_info = self.get_hcomm_info(self.comm_group.device_group)
+
+    def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        input_parallel = self.get_input_parallel(input_)
+        """Calculate the output tensor of forward by considering
+        fusing communication and computation."""
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        if self.reduce_results and self.tp_size > 1:
+            output = torch_npu.npu_mm_all_reduce_base(
+                input_parallel, self.layer.weight.t(), self.hcomm_info, bias=bias_
+            )
+        else:
+            assert self.quant_method is not None
+            output = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+    @classmethod
+    def get_hcomm_info(cls, group: dist.ProcessGroup) -> str:
+        """Get the HCCL communication information for the given group."""
+        if cls._HCOMM_INFO is not None:
+            return cls._HCOMM_INFO
+
+        rank = torch.distributed.get_rank(group)
+        if torch.__version__ > '2.0':
+            global_rank = torch.distributed.get_global_rank(group, rank)
+            cls._HCOMM_INFO = group._get_backend(torch.device('npu')).get_hccl_comm_name(global_rank)
+        else:
+            cls._HCOMM_INFO = group.get_hccl_comm_name(rank)
+        return cls._HCOMM_INFO
+
+
 class ShardedCPColumnParallelOp(CustomColumnParallelOp):
     @property
     def comm_group(self):
@@ -315,6 +355,8 @@ def _get_row_parallel_op(prefix, layer) -> MLPRowParallelOp | OProjRowParallelOp
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
+    if int(os.getenv("VLLM_ENABLE_MATMUL_ALLREDUCE_FUSE", "0")) == 1:
+        return MatmulAllreduceRowParallelOp(layer)
     return None
 
 
